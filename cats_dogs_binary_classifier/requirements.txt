@@ -1,1 +1,5 @@
 kaggle
+torch
+torchvision
+pillow
+sklearn
