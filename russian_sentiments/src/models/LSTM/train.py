@@ -6,12 +6,14 @@ import pandas as pd
 from collections import Counter
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, DataLoader
-from src.models.LSTM.model import RNN
+from src.models.LSTM.model import RNN, LRScheduler, EarlyStopping
+from pickle import dump
+import json
 
 
 class CustomVocabulary:
-    def __init__(self, df):
-        self.df = df
+    def __init__(self, df_path):
+        self.df = pd.read_csv(df_path).dropna(subset=['comment_preprocessed_str'])
         self.vocab = self.get_vocabulary()
 
     def get_vocabulary(self):
@@ -29,9 +31,9 @@ class CustomVocabulary:
 
 
 class CustomDataset(Dataset):
-    def __init__(self, df_path):
-        self.df = pd.read_csv(df_path)
-        self.vocab = CustomVocabulary(self.df)
+    def __init__(self, df_path, vocab):
+        self.df = pd.read_csv(df_path).dropna(subset=['comment_preprocessed_str'])
+        self.vocab = vocab
 
     def __len__(self):
         return self.df.shape[0]
@@ -63,9 +65,9 @@ class CustomCollate:
         return text, torch.tensor(target)
 
 
-def get_dataloader(df_path, batch_size=64, shuffle=True):
+def get_dataloader(df_path, vocab, batch_size=64, shuffle=True):
 
-    train_dataset = CustomDataset(df_path)
+    train_dataset = CustomDataset(df_path, vocab)
     pad_idx = train_dataset.vocab.vocab.stoi['<pad>']
 
     train_loader = DataLoader(
@@ -85,54 +87,115 @@ def binary_accuracy(predictions, y):
     return acc
 
 
-def train_fn(model, data_loader, criterion, optimizer, num_epochs, device):
+def train_fn(model, data_loader, criterion, optimizer, device):
+    epoch_loss = 0
+    epoch_acc = 0
 
-    history = []
-    for epoch in range(num_epochs):
-        epoch_loss = 0
-        epoch_acc = 0
+    model.train()
+    for batch_idx, (data, target) in enumerate(data_loader):
+        data = data.to(device)
+        target = target.to(device)
+        text_lengths = torch.tensor([data.size(0)] * data.size(1))
+
+        optimizer.zero_grad()
+
+        predictions = model(data, text_lengths)
+        predictions = predictions.squeeze(1)
+
+        target = target.type_as(predictions)
+
+        loss = criterion(predictions, target)
+
+        loss.backward()
+        optimizer.step()
+
+        acc = binary_accuracy(predictions, target)
+        epoch_acc += acc.item()
+        epoch_loss += loss.item()
+
+    epoch_loss = epoch_loss / len(data_loader)
+    epoch_acc = epoch_acc / len(data_loader)
+
+    return epoch_loss, epoch_acc
+
+
+def valid_fn(model, data_loader, criterion, device):
+    epoch_loss = 0
+    epoch_acc = 0
+
+    model.eval()
+    with torch.no_grad():
         for batch_idx, (data, target) in enumerate(data_loader):
-
             data = data.to(device)
             target = target.to(device)
+
             text_lengths = torch.tensor([data.size(0)] * data.size(1))
-
-            optimizer.zero_grad()
-
             predictions = model(data, text_lengths)
             predictions = predictions.squeeze(1)
-
             target = target.type_as(predictions)
 
             loss = criterion(predictions, target)
-
-            loss.backward()
-            optimizer.step()
 
             acc = binary_accuracy(predictions, target)
             epoch_acc += acc.item()
             epoch_loss += loss.item()
 
-        epoch_loss = epoch_loss / len(data_loader)
-        epoch_acc = epoch_acc / len(data_loader)
-        print(f'Epoch {epoch+1} loss: {epoch_loss}, acc: {epoch_acc}')
+    epoch_loss = epoch_loss / len(data_loader)
+    epoch_acc = epoch_acc / len(data_loader)
 
-        history.append(epoch_loss)
+    return epoch_loss, epoch_acc
+
+
+def train(model,
+          train_loader, val_loader,
+          criterion, optimizer,
+          lr_scheduler, early_stopping,
+          num_epochs, device):
+
+    history = {
+        'train_loss': [],
+        'train_acc': [],
+        'val_loss': [],
+        'val_acc': []
+    }
+
+    for epoch in range(num_epochs):
+
+        tr_epoch_loss, tr_epoch_acc = train_fn(model, train_loader, criterion, optimizer, device)
+        val_epoch_loss, val_epoch_acc = valid_fn(model, val_loader, criterion, device)
+
+        print(f'Epoch {epoch+1}  train loss: {tr_epoch_loss}, train acc: {tr_epoch_acc}, '
+              f'val loss: {val_epoch_loss}, val acc: {val_epoch_acc}')
+
+        history['train_loss'].append(tr_epoch_loss)
+        history['train_acc'].append(tr_epoch_acc)
+        history['val_loss'].append(val_epoch_loss)
+        history['val_acc'].append(val_epoch_acc)
+
+        lr_scheduler(val_epoch_loss)
+        early_stopping(val_epoch_loss)
+        if early_stopping.early_stop:
+            break
 
     return model, history
 
 
 def main():
-    df_path = '../../../data/train.csv'
-    train_loader, train_dataset = get_dataloader(df_path)
+    train_path = '../../../data/train.csv'
+    val_path = '../../../data/test.csv'
+
+    vocab = CustomVocabulary(train_path)
+
+    train_loader, train_dataset = get_dataloader(train_path, vocab)
+    val_loader, val_dataset = get_dataloader(val_path, vocab)
 
     vocab_size = len(train_dataset.vocab.vocab.stoi)
     embedding_size = 100
-    hidden_size = 256
+    hidden_size = 128
     n_layers = 2
     dropout = 0.5
     pad_idx = train_dataset.vocab.vocab.stoi['<pad>']
-    num_epochs = 10
+    num_epochs = 20
     learning_rate = 0.001
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -147,11 +210,21 @@ def main():
 
     criterion = nn.BCEWithLogitsLoss().to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    lr_scheduler = LRScheduler(optimizer)
+    early_stopping = EarlyStopping()
 
     print('Start training.')
-    model, history = train_fn(model, train_loader, criterion, optimizer, num_epochs, device)
+    model, history = train(model,
+                           train_loader, val_loader,
+                           criterion, optimizer,
+                           lr_scheduler, early_stopping,
+                           num_epochs, device)
 
-    torch.save(model.state_dict(), 'lstm_model2')
+    torch.save(model.state_dict(), 'lstm_model.pt')
+    dump(vocab, open('vocabulary.pkl', 'wb'))
+
+    with open('history.json', 'w') as file:
+        json.dump(history, file)
 
 
 if __name__ == '__main__':
