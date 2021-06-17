@@ -221,7 +221,9 @@ def main():
                            num_epochs, device)
 
     torch.save(model.state_dict(), 'lstm_model.pt')
-    dump(vocab, open('vocabulary.pkl', 'wb'))
+
+    with open('word2index.json', 'w') as file:
+        json.dump(dict(vocab.vocab.stoi), file)
 
     with open('history.json', 'w') as file:
         json.dump(history, file)

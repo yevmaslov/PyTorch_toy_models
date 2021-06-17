@@ -3,8 +3,8 @@ import torch
 
 
 class RNN(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, output_dim, n_layers,
-                 bidirectional, dropout, pad_idx):
+    def __init__(self, vocab_size, embedding_dim=100, hidden_dim=128, output_dim=1, n_layers=2,
+                 bidirectional=True, dropout=0.5, pad_idx=1):
         super().__init__()
 
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=pad_idx)
