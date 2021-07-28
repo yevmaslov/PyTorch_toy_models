@@ -1,10 +1,7 @@
 import flask
-import time
 import torch
-import torch.nn as nn
 from flask import Flask
 from flask import request
-from model import RNN
 from inference import load_vocab_model, preprocess
 
 
